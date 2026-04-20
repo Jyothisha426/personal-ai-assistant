@@ -2,7 +2,7 @@
 title: Personal AI Assistant Environment
 emoji: 🤖
 colorFrom: purple
-colorTo: teal
+colorTo: green
 sdk: docker
 pinned: false
 ---
