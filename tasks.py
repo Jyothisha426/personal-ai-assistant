@@ -3,18 +3,83 @@
 # Personal AI Assistant — RL Environment
 # Theme 3.2: World Modeling (Personalized Tasks)
 #
+# HYBRID GRADING: keyword (40%) + LLM-as-Judge via Groq (60%)
+# Falls back to keyword-only if GROQ_API_KEY not set.
+#
 # SCORES MUST BE STRICTLY BETWEEN 0 AND 1.
 # Safe range: 0.0001 (worst) to 0.9999 (best)
 # ─────────────────────────────────────────────────────────────
 
+import os
 import re
+import json
+import urllib.request
+import urllib.error
 from typing import Any
 
 # ════════════════════════════════════════════════════════════════
+# LLM-AS-A-JUDGE (Groq API)
+# ════════════════════════════════════════════════════════════════
+
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
+GROQ_MODEL   = "llama3-8b-8192"   # free, fast, great for judging
+GROQ_URL     = "https://api.groq.com/openai/v1/chat/completions"
+
+def _call_groq(system_prompt: str, user_prompt: str, timeout: int = 10) -> float:
+    """
+    Call Groq API with a scoring prompt.
+    Returns a float in [0, 1] or -1 on failure.
+    """
+    if not GROQ_API_KEY:
+        return -1.0
+
+    payload = json.dumps({
+        "model": GROQ_MODEL,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user",   "content": user_prompt},
+        ],
+        "temperature": 0.0,
+        "max_tokens": 64,
+    }).encode()
+
+    req = urllib.request.Request(
+        GROQ_URL,
+        data=payload,
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {GROQ_API_KEY}",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            data = json.loads(resp.read())
+        text = data["choices"][0]["message"]["content"].strip()
+        # Parse the first float or int found in the response
+        match = re.search(r"\b([01](?:\.\d+)?|\d(?:\.\d+)?)\b", text)
+        if match:
+            val = float(match.group(1))
+            return min(max(val, 0.0), 1.0)
+    except Exception:
+        pass
+    return -1.0
+
+
+def hybrid_score(keyword_score: float, llm_score: float,
+                 kw_weight: float = 0.4, llm_weight: float = 0.6) -> float:
+    """
+    Combine keyword score and LLM score.
+    If LLM is unavailable (llm_score == -1), fall back to keyword only.
+    """
+    if llm_score < 0:
+        return keyword_score          # graceful fallback
+    combined = kw_weight * keyword_score + llm_weight * llm_score
+    return round(min(max(combined, 0.0001), 0.9999), 4)
+
+
+# ════════════════════════════════════════════════════════════════
 # TASK 1 — TOUGH EMAIL REPLY
-# Agent must write a professional, empathetic reply to a
-# difficult email. Scored on empathy, relevance, professionalism,
-# actionability, and length.
 # ════════════════════════════════════════════════════════════════
 
 TOUGH_EMAIL_SCENARIOS = [
@@ -156,15 +221,14 @@ TOUGH_EMAIL_SCENARIOS = [
 ]
 
 
-def grade_email_reply(response: str, scenario: dict) -> float:
+def _keyword_email(response: str, scenario: dict) -> float:
+    """Pure keyword scoring for email reply (original logic)."""
     if not response or len(response.strip()) < 20:
         return 0.0001
-
     text = response.lower()
     words = text.split()
     word_count = len(words)
 
-    # 1. Length score (10%) — 50-200 words ideal
     if 50 <= word_count <= 200:
         length_score = 1.0
     elif 30 <= word_count < 50 or 200 < word_count <= 280:
@@ -174,44 +238,54 @@ def grade_email_reply(response: str, scenario: dict) -> float:
     else:
         length_score = 0.4
 
-    # 2. Empathy score (25%) — acknowledges sender's emotion
     empathy_hits = sum(1 for p in scenario["empathy_phrases"] if p in text)
     empathy_score = min(empathy_hits / 2, 1.0)
 
-    # 3. Relevance score (25%) — addresses actual topic
     keyword_hits = sum(1 for k in scenario["keywords"] if k in text)
     relevance_score = min(keyword_hits / 3, 1.0)
 
-    # 4. Professionalism score (20%)
     prof_indicators = ["dear", "sincerely", "regards", "thank you", "please", "would", "could", "appreciate"]
     unprofessional = ["wtf", "hell", "damn", "stupid", "idiot", "whatever", "not my problem"]
     prof_hits = sum(1 for p in prof_indicators if p in text)
     unpro_hits = sum(1 for u in unprofessional if u in text)
     professionalism_score = min(prof_hits / 3, 1.0) * (0.0 if unpro_hits > 0 else 1.0)
 
-    # 5. Actionability score (20%) — offers a concrete next step
     action_indicators = ["will", "schedule", "contact", "call", "send", "arrange", "provide",
                          "ensure", "follow up", "reach out", "let me", "i'll", "we'll", "by"]
     action_hits = sum(1 for a in action_indicators if a in text)
     actionability_score = min(action_hits / 2, 1.0)
 
-    # Weighted total
-    total = (
+    return round(min(max(
         0.10 * length_score +
         0.25 * empathy_score +
         0.25 * relevance_score +
         0.20 * professionalism_score +
-        0.20 * actionability_score
-    )
+        0.20 * actionability_score,
+        0.0001), 0.9999), 4)
 
-    # Clamp to safe range
-    return round(min(max(total, 0.0001), 0.9999), 4)
+
+def grade_email_reply(response: str, scenario: dict) -> float:
+    kw = _keyword_email(response, scenario)
+
+    system = (
+        "You are an expert evaluator for professional email responses. "
+        "Score the reply from 0.0 to 1.0 based on: empathy (does it acknowledge the sender's emotion?), "
+        "relevance (does it address the actual issue?), professionalism (tone, structure), "
+        "and actionability (does it offer a concrete next step?). "
+        "Output ONLY a decimal number between 0.0 and 1.0. Nothing else."
+    )
+    user = (
+        f"ORIGINAL EMAIL:\nSubject: {scenario['subject']}\n{scenario['body']}\n\n"
+        f"CONTEXT: {scenario['context']}\n\n"
+        f"AGENT REPLY:\n{response}\n\n"
+        "Score (0.0-1.0):"
+    )
+    llm = _call_groq(system, user)
+    return hybrid_score(kw, llm)
 
 
 # ════════════════════════════════════════════════════════════════
 # TASK 2 — SCHEDULE CONFLICT RESOLUTION
-# Agent receives a messy scheduling situation and must produce
-# a clear resolution: what to reschedule, who to notify, priority.
 # ════════════════════════════════════════════════════════════════
 
 SCHEDULE_CONFLICT_SCENARIOS = [
@@ -323,14 +397,12 @@ SCHEDULE_CONFLICT_SCENARIOS = [
 ]
 
 
-def grade_schedule_resolution(response: str, scenario: dict) -> float:
+def _keyword_schedule(response: str, scenario: dict) -> float:
     if not response or len(response.strip()) < 20:
         return 0.0001
-
     text = response.lower()
     words = text.split()
 
-    # 1. Length (10%) — a resolution needs substance
     if 40 <= len(words) <= 250:
         length_score = 1.0
     elif 20 <= len(words) < 40:
@@ -338,33 +410,48 @@ def grade_schedule_resolution(response: str, scenario: dict) -> float:
     else:
         length_score = 0.3
 
-    # 2. Covers key elements (35%)
     keyword_hits = sum(1 for k in scenario["resolution_keywords"] if k in text)
     coverage_score = min(keyword_hits / 4, 1.0)
 
-    # 3. Mentions all must-include items (30%)
     must_hits = sum(1 for m in scenario["must_include"] if m in text)
     must_score = must_hits / len(scenario["must_include"])
 
-    # 4. Has a clear decision / action (25%)
     decision_words = ["will", "should", "reschedule", "priorit", "delegat", "attend", "skip",
                       "cancel", "move", "handle", "plan", "first", "then", "next"]
     decision_hits = sum(1 for d in decision_words if d in text)
     decision_score = min(decision_hits / 3, 1.0)
 
-    total = (
+    return round(min(max(
         0.10 * length_score +
         0.35 * coverage_score +
         0.30 * must_score +
-        0.25 * decision_score
+        0.25 * decision_score,
+        0.0001), 0.9999), 4)
+
+
+def grade_schedule_resolution(response: str, scenario: dict) -> float:
+    kw = _keyword_schedule(response, scenario)
+
+    system = (
+        "You are an expert evaluator for scheduling and conflict resolution responses. "
+        "Score the resolution from 0.0 to 1.0 based on: "
+        "clarity of prioritization (does it clearly state what comes first?), "
+        "coverage (does it address all mentioned conflicts?), "
+        "practicality (are the decisions realistic?), and decisiveness (no vague hedging). "
+        "Output ONLY a decimal number between 0.0 and 1.0. Nothing else."
     )
-    return round(min(max(total, 0.0001), 0.9999), 4)
+    user = (
+        f"SCHEDULING SITUATION:\n{scenario['situation']}\n\n"
+        f"CONSTRAINTS:\n" + "\n".join(f"- {c}" for c in scenario["constraints"]) +
+        f"\n\nAGENT RESOLUTION:\n{response}\n\n"
+        "Score (0.0-1.0):"
+    )
+    llm = _call_groq(system, user)
+    return hybrid_score(kw, llm)
 
 
 # ════════════════════════════════════════════════════════════════
 # TASK 3 — PERSONAL MESSAGE HANDLING
-# Agent must reply to personal/WhatsApp-style messages with
-# appropriate empathy and tone. Not business-formal.
 # ════════════════════════════════════════════════════════════════
 
 PERSONAL_MESSAGE_SCENARIOS = [
@@ -491,14 +578,12 @@ PERSONAL_MESSAGE_SCENARIOS = [
 ]
 
 
-def grade_personal_message(response: str, scenario: dict) -> float:
+def _keyword_personal(response: str, scenario: dict) -> float:
     if not response or len(response.strip()) < 10:
         return 0.0001
-
     text = response.lower()
     words = text.split()
 
-    # 1. Length (15%) — personal messages should be conversational, not essays
     if 15 <= len(words) <= 120:
         length_score = 1.0
     elif 8 <= len(words) < 15 or 120 < len(words) <= 180:
@@ -506,32 +591,49 @@ def grade_personal_message(response: str, scenario: dict) -> float:
     else:
         length_score = 0.3
 
-    # 2. Empathy / tone keywords (40%)
     keyword_hits = sum(1 for k in scenario["keywords"] if k in text)
     keyword_score = min(keyword_hits / 3, 1.0)
 
-    # 3. Avoids inappropriate phrases (30%)
     avoid_hits = sum(1 for a in scenario["avoid"] if a in text)
     avoid_score = 1.0 if avoid_hits == 0 else max(0.0, 1.0 - avoid_hits * 0.4)
 
-    # 4. Not a refusal (15%)
     refusal_phrases = ["cannot help", "i can't respond", "as an ai", "i am not able"]
     refusal_hits = sum(1 for r in refusal_phrases if r in text)
     refusal_score = 0.0 if refusal_hits > 0 else 1.0
 
-    total = (
+    return round(min(max(
         0.15 * length_score +
         0.40 * keyword_score +
         0.30 * avoid_score +
-        0.15 * refusal_score
+        0.15 * refusal_score,
+        0.0001), 0.9999), 4)
+
+
+def grade_personal_message(response: str, scenario: dict) -> float:
+    kw = _keyword_personal(response, scenario)
+
+    system = (
+        "You are an expert evaluator for personal/conversational message replies. "
+        "Score the reply from 0.0 to 1.0 based on: "
+        "emotional tone (does it match the expected tone?), "
+        "empathy (does it genuinely acknowledge the sender's feelings?), "
+        "naturalness (does it sound like a real human, not a bot?), "
+        "and appropriateness (no unsolicited advice, no dismissiveness). "
+        "Output ONLY a decimal number between 0.0 and 1.0. Nothing else."
     )
-    return round(min(max(total, 0.0001), 0.9999), 4)
+    user = (
+        f"FROM: {scenario['from']}\n"
+        f"MESSAGE: {scenario['message']}\n"
+        f"EXPECTED TONE: {scenario['tone_expected']}\n\n"
+        f"AGENT REPLY:\n{response}\n\n"
+        "Score (0.0-1.0):"
+    )
+    llm = _call_groq(system, user)
+    return hybrid_score(kw, llm)
 
 
 # ════════════════════════════════════════════════════════════════
 # TASK 4 — DINNER & TRAVEL PLANNING
-# Agent receives a planning request with constraints and must
-# produce a concrete, actionable plan satisfying all constraints.
 # ════════════════════════════════════════════════════════════════
 
 PLANNING_SCENARIOS = [
@@ -628,14 +730,12 @@ PLANNING_SCENARIOS = [
 ]
 
 
-def grade_planning_response(response: str, scenario: dict) -> float:
+def _keyword_planning(response: str, scenario: dict) -> float:
     if not response or len(response.strip()) < 20:
         return 0.0001
-
     text = response.lower()
     words = text.split()
 
-    # 1. Length (15%) — plans need detail
     if 60 <= len(words) <= 350:
         length_score = 1.0
     elif 30 <= len(words) < 60:
@@ -643,36 +743,52 @@ def grade_planning_response(response: str, scenario: dict) -> float:
     else:
         length_score = 0.3
 
-    # 2. Addresses all constraints (40%)
     must_hits = sum(1 for m in scenario["must_address"] if m.lower() in text)
     constraint_score = must_hits / len(scenario["must_address"])
 
-    # 3. Concreteness — specific details, not vague advice (30%)
     concrete_indicators = ["recommend", "suggest", "option", "restaurant", "place",
                            "time", "cost", "budget", "step", "day", "hour", "km",
                            "₹", "minute", "first", "then", "next", "finally"]
     concrete_hits = sum(1 for c in concrete_indicators if c in text)
     concrete_score = min(concrete_hits / 4, 1.0)
 
-    # 4. Actionability (15%) — clear next steps
     action_words = ["go to", "book", "call", "order", "take", "start", "arrive",
                     "leave", "plan", "prepare", "visit", "check"]
     action_hits = sum(1 for a in action_words if a in text)
     action_score = min(action_hits / 2, 1.0)
 
-    total = (
+    return round(min(max(
         0.15 * length_score +
         0.40 * constraint_score +
         0.30 * concrete_score +
-        0.15 * action_score
+        0.15 * action_score,
+        0.0001), 0.9999), 4)
+
+
+def grade_planning_response(response: str, scenario: dict) -> float:
+    kw = _keyword_planning(response, scenario)
+
+    system = (
+        "You are an expert evaluator for planning and logistics responses. "
+        "Score the plan from 0.0 to 1.0 based on: "
+        "constraint coverage (does it address ALL stated constraints?), "
+        "specificity (real names, times, costs — not vague advice), "
+        "feasibility (is the plan actually doable?), "
+        "and completeness (does it give a full plan, not just suggestions?). "
+        "Output ONLY a decimal number between 0.0 and 1.0. Nothing else."
     )
-    return round(min(max(total, 0.0001), 0.9999), 4)
+    user = (
+        f"REQUEST: {scenario['request']}\n\n"
+        f"CONSTRAINTS:\n" + "\n".join(f"- {c}" for c in scenario["constraints"]) +
+        f"\n\nAGENT PLAN:\n{response}\n\n"
+        "Score (0.0-1.0):"
+    )
+    llm = _call_groq(system, user)
+    return hybrid_score(kw, llm)
 
 
 # ════════════════════════════════════════════════════════════════
-# TASK 5 — SCHEMA DRIFT (Patronus AI bonus theme)
-# Agent handles a multi-step workflow where rules/context
-# change mid-task. Tests adaptability.
+# TASK 5 — SCHEMA DRIFT
 # ════════════════════════════════════════════════════════════════
 
 SCHEMA_DRIFT_SCENARIOS = [
@@ -799,14 +915,12 @@ SCHEMA_DRIFT_SCENARIOS = [
 ]
 
 
-def grade_schema_drift(response: str, scenario: dict) -> float:
+def _keyword_drift(response: str, scenario: dict) -> float:
     if not response or len(response.strip()) < 20:
         return 0.0001
-
     text = response.lower()
     words = text.split()
 
-    # 1. Length (10%)
     if 40 <= len(words) <= 300:
         length_score = 1.0
     elif 20 <= len(words) < 40:
@@ -814,27 +928,47 @@ def grade_schema_drift(response: str, scenario: dict) -> float:
     else:
         length_score = 0.3
 
-    # 2. Acknowledges the drift/change (30%)
     drift_hits = sum(1 for a in scenario["adaption_keywords"] if a in text)
     drift_score = min(drift_hits / 2, 1.0)
 
-    # 3. Provides a concrete alternative (40%)
     keyword_hits = sum(1 for k in scenario["keywords"] if k in text)
     alternative_score = min(keyword_hits / 3, 1.0)
 
-    # 4. Actionable resolution (20%)
     action_words = ["will", "can", "should", "recommend", "suggest", "try", "use",
                     "book", "send", "find", "contact", "choose", "switch", "instead"]
     action_hits = sum(1 for a in action_words if a in text)
     action_score = min(action_hits / 2, 1.0)
 
-    total = (
+    return round(min(max(
         0.10 * length_score +
         0.30 * drift_score +
         0.40 * alternative_score +
-        0.20 * action_score
+        0.20 * action_score,
+        0.0001), 0.9999), 4)
+
+
+def grade_schema_drift(response: str, scenario: dict) -> float:
+    kw = _keyword_drift(response, scenario)
+
+    system = (
+        "You are an expert evaluator for adaptive problem-solving responses. "
+        "The agent was given a task, but something changed mid-task. "
+        "Score the response from 0.0 to 1.0 based on: "
+        "acknowledgment (does it recognize and address the change?), "
+        "adaptability (does it provide a concrete alternative?), "
+        "practicality (is the alternative actually useful?), "
+        "and decisiveness (no vague 'it depends' hedging). "
+        "Output ONLY a decimal number between 0.0 and 1.0. Nothing else."
     )
-    return round(min(max(total, 0.0001), 0.9999), 4)
+    user = (
+        f"ORIGINAL TASK: {scenario['initial_task']}\n"
+        f"WHAT CHANGED: {scenario['drift_event']}\n"
+        f"NEW REQUIREMENT: {scenario['new_constraint']}\n\n"
+        f"AGENT RESPONSE:\n{response}\n\n"
+        "Score (0.0-1.0):"
+    )
+    llm = _call_groq(system, user)
+    return hybrid_score(kw, llm)
 
 
 # ════════════════════════════════════════════════════════════════

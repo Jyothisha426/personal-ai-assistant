@@ -12,6 +12,7 @@ Score must be STRICTLY between 0 and 1 (not 0.0, not 1.0).
 import os
 import sys
 import asyncio
+import time
 import httpx
 from openai import OpenAI
 
@@ -46,22 +47,35 @@ def make_llm_client() -> OpenAI:
     return OpenAI(base_url=API_BASE_URL, api_key=API_KEY)
 
 
-def call_llm(client: OpenAI, system: str, user: str, max_tokens: int = 400) -> str:
-    try:
-        resp = client.chat.completions.create(
-            model=MODEL_NAME,
-            messages=[
-                {"role": "system", "content": system},
-                {"role": "user",   "content": user},
-            ],
-            temperature=0.3,
-            max_tokens=max_tokens,
-            stream=False,
-        )
-        return (resp.choices[0].message.content or "").strip()
-    except Exception as e:
-        print(f"[DEBUG] LLM error: {e}", file=sys.stderr, flush=True)
-        return ""
+def call_llm(client: OpenAI, system: str, user: str, max_tokens: int = 400,
+             max_retries: int = 3) -> str:
+    """
+    Call LLM with exponential backoff retry.
+    Retries up to max_retries times on failure before returning empty string.
+    """
+    for attempt in range(max_retries):
+        try:
+            resp = client.chat.completions.create(
+                model=MODEL_NAME,
+                messages=[
+                    {"role": "system", "content": system},
+                    {"role": "user",   "content": user},
+                ],
+                temperature=0.3,
+                max_tokens=max_tokens,
+                stream=False,
+            )
+            result = (resp.choices[0].message.content or "").strip()
+            if result:
+                return result
+            # Empty response — retry
+            print(f"[DEBUG] LLM returned empty (attempt {attempt+1}/{max_retries})", file=sys.stderr, flush=True)
+        except Exception as e:
+            wait = 2 ** attempt  # 1s, 2s, 4s
+            print(f"[DEBUG] LLM error (attempt {attempt+1}/{max_retries}): {e} — retrying in {wait}s", file=sys.stderr, flush=True)
+            if attempt < max_retries - 1:
+                time.sleep(wait)
+    return ""
 
 
 # ── System prompt ─────────────────────────────────────────────────────────────
@@ -229,15 +243,15 @@ Your adapted plan:"""
 
 
 ACTION_BUILDERS = {
-    "tough_email_reply":     build_email_action,
-    "schedule_conflict":     build_schedule_action,
-    "personal_message":      build_personal_msg_action,
+    "tough_email_reply":      build_email_action,
+    "schedule_conflict":      build_schedule_action,
+    "personal_message":       build_personal_msg_action,
     "dinner_travel_planning": build_planning_action,
-    "schema_drift":          build_drift_action,
+    "schema_drift":           build_drift_action,
 }
 
 
-# ── Env HTTP calls ────────────────────────────────────────────────────────────
+# ── Env HTTP calls (with retry) ───────────────────────────────────────────────
 async def env_health(http: httpx.AsyncClient) -> bool:
     try:
         r = await http.get(f"{ENV_BASE_URL}/health", timeout=15)
@@ -247,16 +261,35 @@ async def env_health(http: httpx.AsyncClient) -> bool:
         return False
 
 
-async def env_reset(http: httpx.AsyncClient, task_name: str) -> dict:
-    r = await http.post(f"{ENV_BASE_URL}/reset", json={"task_name": task_name}, timeout=30)
-    r.raise_for_status()
-    return r.json()
+async def env_reset(http: httpx.AsyncClient, task_name: str,
+                    max_retries: int = 3) -> dict:
+    for attempt in range(max_retries):
+        try:
+            r = await http.post(f"{ENV_BASE_URL}/reset",
+                                json={"task_name": task_name}, timeout=30)
+            r.raise_for_status()
+            return r.json()
+        except Exception as e:
+            wait = 2 ** attempt
+            print(f"[DEBUG] reset error (attempt {attempt+1}/{max_retries}): {e}", file=sys.stderr, flush=True)
+            if attempt < max_retries - 1:
+                await asyncio.sleep(wait)
+    raise RuntimeError(f"env_reset failed after {max_retries} attempts")
 
 
-async def env_step(http: httpx.AsyncClient, action: dict) -> dict:
-    r = await http.post(f"{ENV_BASE_URL}/step", json=action, timeout=30)
-    r.raise_for_status()
-    return r.json()
+async def env_step(http: httpx.AsyncClient, action: dict,
+                   max_retries: int = 3) -> dict:
+    for attempt in range(max_retries):
+        try:
+            r = await http.post(f"{ENV_BASE_URL}/step", json=action, timeout=30)
+            r.raise_for_status()
+            return r.json()
+        except Exception as e:
+            wait = 2 ** attempt
+            print(f"[DEBUG] step error (attempt {attempt+1}/{max_retries}): {e}", file=sys.stderr, flush=True)
+            if attempt < max_retries - 1:
+                await asyncio.sleep(wait)
+    raise RuntimeError(f"env_step failed after {max_retries} attempts")
 
 
 # ── Episode runner ────────────────────────────────────────────────────────────
