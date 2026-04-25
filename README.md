@@ -121,3 +121,10 @@ python inference.py
 | `API_KEY`      | Your API key (injected by validator) |
 | `MODEL_NAME`   | Model to use (default: gpt-4o-mini)  |
 | `ENV_BASE_URL` | Environment server URL               |
+
+---
+
+## Notebook & Blog
+
+- 🧪 **Training Notebook (Google Colab)**: https://colab.research.google.com/drive/1Eang1ybDBLhi8373pX3TOvm_c98Br4AK?usp=sharing
+- 📝 **Blog Post**: See `blog.md` in this repository
