@@ -133,10 +133,7 @@ TASK_NAMES = list(TASK_REGISTRY.keys())
 TASK_LABELS = [t.replace("_", " ").title() for t in TASK_NAMES]
 TASK_MAP = dict(zip(TASK_LABELS, TASK_NAMES))
 
-with gr.Blocks(
-    theme=gr.themes.Soft(primary_hue="violet", secondary_hue="blue"),
-    title="Personal AI Assistant — RL Environment Demo",
-) as demo:
+with gr.Blocks(title="Personal AI Assistant — RL Environment Demo") as demo:
 
     gr.Markdown("""
 # 🤖 Personal AI Assistant — RL Environment
