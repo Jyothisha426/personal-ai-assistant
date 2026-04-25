@@ -1,4 +1,4 @@
-FROM python:3.11-slim
+FROM python:3.10-slim          # <- was 3.11-slim (3.10 is safer for gradio)
 
 WORKDIR /app
 
@@ -9,4 +9,4 @@ COPY . .
 
 EXPOSE 7860
 
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "7860"]
+CMD ["python", "app.py"]       # <- was uvicorn main:app  (THIS was the bug)
